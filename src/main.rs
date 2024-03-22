@@ -17,21 +17,21 @@ enum Command {
 fn main() -> Result<(), Error> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Save => wstash_save(),
-        Command::Restore => wstash_restore(),
+        Command::Save => ustash_save(),
+        Command::Restore => ustash_restore(),
     }
 }
 
-fn wstash_save() -> Result<(), Error> {
+fn ustash_save() -> Result<(), Error> {
     let repo = Repository::open(".")?;
 
-    match repo.find_reference("refs/wstash") {
+    match repo.find_reference("refs/ustash") {
         Err(err) => match err.code() {
             ErrorCode::NotFound => Ok(()),
             _ => Err(err),
         },
         Ok(_) => {
-            println!("refs/wstash already exists");
+            println!("refs/ustash already exists");
             std::process::exit(1)
         }
     }?;
@@ -78,14 +78,14 @@ fn wstash_save() -> Result<(), Error> {
     let new_tree_id = tree_builder.create_updated(&repo, &empty_tree)?;
     let new_tree = repo.find_tree(new_tree_id)?;
 
-    let signature = Signature::now("wstash", "omitted").unwrap();
+    let signature = Signature::now("ustash", "omitted").unwrap();
     let head_ref = repo.head()?;
     let head_commit = head_ref.peel_to_commit()?;
     let _commit_oid = repo.commit(
-        Some("refs/wstash"),
+        Some("refs/ustash"),
         &signature,
         &signature,
-        "wstash",
+        "ustash",
         &new_tree,
         &[&head_commit],
     )?;
@@ -109,10 +109,10 @@ fn wstash_save() -> Result<(), Error> {
     Ok(())
 }
 
-fn wstash_restore() -> Result<(), Error> {
+fn ustash_restore() -> Result<(), Error> {
     let repo = Repository::open(".")?;
 
-    let mut reference = repo.find_reference("refs/wstash")?;
+    let mut reference = repo.find_reference("refs/ustash")?;
     let commit = reference.peel_to_commit()?;
 
     let tree = commit.tree()?;
