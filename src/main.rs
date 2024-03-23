@@ -1,7 +1,12 @@
 use clap::{Parser, Subcommand};
-use git2::{build::TreeUpdateBuilder, Error, ErrorCode, FileMode, Repository, Signature};
-use std::{fs, path::PathBuf};
+use git2::{build::TreeUpdateBuilder, ErrorCode, FileMode, Repository};
+use std::{
+    fmt::Display,
+    fs,
+    path::{Path, PathBuf},
+};
 
+/// Save and restore unstaged files in Git.
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -10,64 +15,142 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /** Save unstaged files.
+
+    Saves unstaged files only, and leaves the index untouched (`git diff --cached` is not affected).
+    After `git-ustash save`, `git diff` will report no modifications (only deletions).
+
+    Fails if there is already a saved set of unstaged files.
+    */
     Save,
+    /** Restore previously-saved unstaged files.
+
+    Restores previously-saved unstaged files only, leaving the index untouched.
+
+    `git-ustash save && git-ustash restore` is equivalent to a no-op.
+    */
     Restore,
 }
 
-fn main() -> Result<(), Error> {
-    let cli = Cli::parse();
-    match cli.command {
-        Command::Save => ustash_save(),
-        Command::Restore => ustash_restore(),
+#[derive(Debug)]
+enum Error {
+    Git2(git2::Error),
+    ActiveStash,
+    NoActiveStash,
+    GitDirNotFound,
+}
+
+impl From<git2::Error> for Error {
+    fn from(value: git2::Error) -> Self {
+        Error::Git2(value)
     }
 }
 
-fn ustash_save() -> Result<(), Error> {
-    let repo = Repository::open(".")?;
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Git2(err) => err.fmt(f),
+            Error::ActiveStash => f.write_str("there is already an active ustash"),
+            Error::NoActiveStash => f.write_str("there is no active ustash"),
+            Error::GitDirNotFound => f.write_str("not inside a Git repository"),
+        }
+    }
+}
 
-    match repo.find_reference("refs/ustash") {
+fn main() {
+    let cli = Cli::parse();
+
+    fn search_upward_for_entry<P: AsRef<Path>>(cwd: P, entry: &str) -> Option<PathBuf> {
+        let mut target_dir = std::fs::canonicalize(cwd.as_ref()).unwrap();
+        let mut found = false;
+
+        loop {
+            let target_file_exists = {
+                target_dir.push(entry);
+                let result = target_dir.try_exists().unwrap();
+                target_dir.pop();
+                result
+            };
+
+            if target_file_exists {
+                found = true;
+                break;
+            }
+
+            if !target_dir.pop() {
+                break;
+            }
+        }
+
+        if found {
+            Some(target_dir)
+        } else {
+            None
+        }
+    }
+
+    let run = || {
+        let repo_path = search_upward_for_entry(".", ".git").ok_or(Error::GitDirNotFound)?;
+        let repo = Repository::open(repo_path)?;
+        match cli.command {
+            Command::Save => ustash_save(&repo),
+            Command::Restore => ustash_restore(&repo),
+        }
+    };
+
+    match run() {
+        Err(err) => {
+            eprintln!("error: {}", err);
+            std::process::exit(1);
+        }
+        Ok(()) => {
+            std::process::exit(0);
+        }
+    }
+}
+
+const USTASH_REF: &str = "refs/ustash";
+
+fn ustash_save(repo: &Repository) -> Result<(), Error> {
+    match repo.find_reference(USTASH_REF) {
+        Ok(_) => Err(Error::ActiveStash),
         Err(err) => match err.code() {
             ErrorCode::NotFound => Ok(()),
-            _ => Err(err),
+            _ => Err(Error::from(err)),
         },
-        Ok(_) => {
-            println!("refs/ustash already exists");
-            std::process::exit(1)
-        }
     }?;
 
     let index = repo.index()?;
 
-    let empty_tree_oid = repo.treebuilder(None)?.write()?;
-    let empty_tree = repo.find_tree(empty_tree_oid).unwrap();
-
-    let mut tree_builder = TreeUpdateBuilder::new();
-
     let diff = repo.diff_index_to_workdir(Some(&index), None)?;
+
     let mut paths = vec![];
+    let mut tree_builder = TreeUpdateBuilder::new();
     diff.foreach(
         &mut |delta, _| {
             if let Some(path) = delta.new_file().path() {
-                match fs::read(path) {
+                let path_absolute = repo.path().parent().unwrap().join(path);
+                match fs::read(&path_absolute) {
                     Ok(content) => match repo.blob(&content) {
                         Err(err) => {
-                            eprintln!("error: {}", err);
-                            false
+                            panic!("internal error: {}", err);
                         }
                         Ok(oid) => {
                             tree_builder.upsert(path, oid, FileMode::Blob);
-                            paths.push(PathBuf::from(path));
+                            paths.push((path_absolute, PathBuf::from(path)));
                             true
                         }
                     },
                     Err(err) => {
-                        eprintln!("error: {}", err);
-                        false
+                        panic!(
+                            "internal error: failed to read {}: {}",
+                            path_absolute.display(),
+                            err
+                        );
                     }
                 }
             } else {
-                eprintln!("internal error: delta has no path");
-                false
+                panic!("internal error: delta has no path");
             }
         },
         None,
@@ -75,10 +158,12 @@ fn ustash_save() -> Result<(), Error> {
         None,
     )?;
 
-    let new_tree_id = tree_builder.create_updated(&repo, &empty_tree)?;
+    let empty_tree_oid = repo.treebuilder(None)?.write()?;
+    let empty_tree = repo.find_tree(empty_tree_oid).unwrap();
+    let new_tree_id = tree_builder.create_updated(repo, &empty_tree)?;
     let new_tree = repo.find_tree(new_tree_id)?;
 
-    let signature = Signature::now("ustash", "omitted").unwrap();
+    let signature = repo.signature()?;
     let head_ref = repo.head()?;
     let head_commit = head_ref.peel_to_commit()?;
     let _commit_oid = repo.commit(
@@ -91,39 +176,68 @@ fn ustash_save() -> Result<(), Error> {
     )?;
 
     let head_tree = head_commit.tree()?;
-    paths
-        .into_iter()
-        .for_each(|path| match index.get_path(&path, 0) {
+    paths.into_iter().for_each(|(path_absolute, path)| {
+        let entry_blob = match index.get_path(&path, 0) {
+            Some(index_entry) => repo.find_blob(index_entry.id).unwrap(),
             None => {
                 let tree_entry = head_tree.get_name(path.to_str().unwrap()).unwrap();
-                let entry_object = tree_entry.to_object(&repo).unwrap();
-                let entry_blob = entry_object.peel_to_blob().unwrap();
-                std::fs::write(path, entry_blob.content()).unwrap();
+                let entry_object = tree_entry.to_object(repo).unwrap();
+                entry_object.peel_to_blob().unwrap()
             }
-            Some(index_entry) => {
-                let entry_blob = repo.find_blob(index_entry.id).unwrap();
-                std::fs::write(path, entry_blob.content()).unwrap();
-            }
-        });
+        };
+        std::fs::write(path_absolute, entry_blob.content()).unwrap();
+    });
 
     Ok(())
 }
 
-fn ustash_restore() -> Result<(), Error> {
-    let repo = Repository::open(".")?;
+fn ustash_restore(repo: &Repository) -> Result<(), Error> {
+    let mut reference = match repo.find_reference(USTASH_REF) {
+        Ok(reference) => Ok(reference),
+        Err(err) => match err.code() {
+            ErrorCode::NotFound => Err(Error::NoActiveStash),
+            _ => Err(Error::from(err)),
+        },
+    }?;
 
-    let mut reference = repo.find_reference("refs/ustash")?;
-    let commit = reference.peel_to_commit()?;
+    fn restore_tree_to_workdir(
+        repo: &Repository,
+        cwd: &mut PathBuf,
+        tree: git2::Tree<'_>,
+    ) -> Result<(), Error> {
+        for entry in &tree {
+            let name = entry.name().unwrap();
+            let entry_object = entry.to_object(repo)?;
 
-    let tree = commit.tree()?;
-    for entry in &tree {
-        let name = entry.name().unwrap();
-        let entry_object = entry.to_object(&repo)?;
-        let entry_blob = entry_object.peel_to_blob()?;
-        std::fs::write(name, entry_blob.content()).unwrap();
+            cwd.push(name);
+            match entry_object.kind().unwrap() {
+                git2::ObjectType::Tree => {
+                    if !cwd.try_exists().unwrap() {
+                        std::fs::create_dir(&*cwd).unwrap();
+                    }
+
+                    let entry_tree = entry_object.peel_to_tree()?;
+                    restore_tree_to_workdir(repo, cwd, entry_tree)?;
+                }
+                git2::ObjectType::Blob => {
+                    let path = &*cwd;
+                    let entry_blob = entry_object.peel_to_blob()?;
+                    std::fs::write(path, entry_blob.content()).unwrap();
+                }
+                kind => panic!("internal error: unexpected Git object kind: {}", kind),
+            }
+            cwd.pop();
+        }
+
+        Ok(())
     }
 
-    reference.delete().unwrap();
+    let commit = reference.peel_to_commit()?;
+    let tree = commit.tree()?;
+    let mut cwd = PathBuf::from(repo.path().parent().unwrap());
+    restore_tree_to_workdir(repo, &mut cwd, tree)?;
+
+    reference.delete()?;
 
     Ok(())
 }
