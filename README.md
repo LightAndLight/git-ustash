@@ -9,7 +9,7 @@ It's an error to call `git-ustash save` while there are previously-saved unstage
 
 ## Installation
 
-Try using Nix: `nix run github:LightAndLight/git-ustash --help`
+Try using Nix: `nix run github:LightAndLight/git-ustash -- --help`
 
 Add to a Nix Flake:
 
