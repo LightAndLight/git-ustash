@@ -1,0 +1,35 @@
+cabal-version:      3.0
+name:               git-ustash-tests
+version:            0.1.0.0
+-- synopsis:
+-- description:
+license:            BSD-3-Clause
+author:             Isaac Elliott
+maintainer:         isaace71295@gmail.com
+-- copyright:
+category:           Testing
+build-type:         Simple
+-- extra-source-files:
+
+common warnings
+    ghc-options: -Wall
+
+test-suite git-ustash-tests
+    import:           warnings
+    default-language: Haskell2010
+    -- other-modules:
+    -- other-extensions:
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   src
+    main-is:          Main.hs
+    build-depends:
+        base ^>=4.18.2.0,
+        containers,
+        directory,
+        filepath,
+        hedgehog,
+        mmorph,
+        monad-control,
+        process,
+        resourcet,
+        temporary-resourcet
