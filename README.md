@@ -45,3 +45,9 @@ The unstaged version (with the remainder of the changes) is the only one on disk
 Using `git stash --keep-index` almost does the right thing; it gets the unstaged files out of the way so it looks like you are free to work on jus the staged files.
 Unfortunately it also stashes the staged files, so that when you auto-format the staged files, re-add them to the index, and pop from the stash, the formatted files are overwritten by the stash.
 [This answer on StackOverflow](https://stackoverflow.com/a/71222518/2884502) looked promising, but `git stash push --staged` fails with an error when I use it in the `git add -p` aforementioned situation.
+
+`git-ustash` doesn't fully solve the pre-commit auto-formatter problem for me, but it has revealed the next step along the way.
+`git-ustash save; formatCode; git add -u; git-ustash restore` restores unformatted unstaged files.
+When some changes are split across staged and unstaged versions of a file (the `git add -p` workflow), formatting that's applied to the staged version is "lost" on the unstaged version.
+This makes the diff after `git-ustash restore` rather noisy and adds busywork into the commit workflow.
+I think the next step would be a program that can modify a staged file and backport the diff to the file's unstaged counterpart.
