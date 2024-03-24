@@ -29,7 +29,7 @@ import Data.Coerce (coerce)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Bifunctor (first)
-import Data.Maybe (isNothing)
+import Data.Maybe (isNothing, fromMaybe)
 
 main :: IO Bool
 main = do
@@ -110,21 +110,21 @@ data State (v :: Type -> Type)
   , state_files :: Map Dir (Map String File)
    
   -- | The currently staged files.
-  , state_staged :: Set FilePath
+  , state_staged :: Map FilePath String
 
   -- | Whether or not the Git repo has commits.
   , state_hasCommits :: Bool
 
   -- | The files currently saved by `git-ustash`
-  , state_ustash :: Maybe (Set FilePath)
+  , state_ustash :: Maybe (Map FilePath String)
   }
 
 data File = File {file_contents :: String, file_status :: FileStatus}
 
 data FileStatus 
   = Untracked
-  | Tracked Bool
-  deriving Eq
+  | Tracked {file_oldContents :: String}
+  deriving (Eq, Show)
 
 initialState :: Dir -> State v
 initialState tmpDir =
@@ -132,22 +132,10 @@ initialState tmpDir =
   { state_root = tmpDir
   , state_workDir = toDir "."
   , state_files = Map.singleton (toDir ".") mempty 
-  , state_staged = Set.empty
+  , state_staged = Map.empty
   , state_ustash = Nothing
   , state_hasCommits = False
   }
-
-data CommandWriteFile (v :: Type -> Type) 
-  = CommandWriteFile 
-      -- | 'root'
-      Dir
-      -- | 'workDir'
-      Dir
-      -- | The path of the file, relative to 'workDir'.
-      FilePath
-      -- | The contents of the file; lines of text.
-      [String]
-  deriving (Show, Generic, FunctorB, TraversableB)
 
 state_untrackedFiles :: State v -> [FilePath]
 state_untrackedFiles state = do
@@ -163,6 +151,18 @@ state_trackedFiles state = do
   guard $ file_status file /= Untracked
   pure $ fromDir dir </> name
 
+data CommandWriteFileUntracked (v :: Type -> Type) 
+  = CommandWriteFileUntracked
+      -- | 'root'
+      Dir
+      -- | 'workDir'
+      Dir
+      -- | The path of the file, relative to 'workDir'.
+      FilePath
+      -- | The contents of the file; lines of text.
+      [String]
+  deriving (Show, Generic, FunctorB, TraversableB)
+
 commandWriteFileUntracked :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
 commandWriteFileUntracked =
   Command 
@@ -170,24 +170,34 @@ commandWriteFileUntracked =
         Just $ do
           name <- Gen.string (Range.constant 1 10) Gen.alphaNum
           contents <- Gen.list (Range.constant 0 100) (Gen.string (Range.constant 0 100) Gen.ascii)
-          pure $ CommandWriteFile (state_root state) (state_workDir state) name contents
+          pure $ CommandWriteFileUntracked (state_root state) (state_workDir state) name contents
     )
-    (\(CommandWriteFile root workDir path content) -> do
+    (\(CommandWriteFileUntracked root workDir path content) -> do
       path' <- evalIO $ canonicalizePath (fromDir (root <> workDir) </> path)
       evalIO $ writeFile path' (unlines content)
     )
-    [ Require $ \state (CommandWriteFile _ workDir name _) ->
+    [ Require $ \state (CommandWriteFileUntracked _ workDir name _) ->
         let dirs = Map.keys $ state_files state in
         (workDir `elem` dirs) &&
         (workDir <> toDir name) `notElem` dirs &&
         (fromDir workDir </> name) `notElem` state_trackedFiles state
-    , Update $ \state (CommandWriteFile _ workDir name content) _output ->
+    , Update $ \state (CommandWriteFileUntracked _ workDir name content) _output ->
         state{ state_files = Map.insertWith (<>) workDir (Map.singleton name $ File (unlines content) Untracked) (state_files state) }
     , Ensure $ \_pre _post _input _output -> do
         label "write file (untracked)"
         
         pure ()
     ]
+
+data CommandWriteFileTracked (v :: Type -> Type) 
+  = CommandWriteFileTracked
+      -- | 'root'
+      Dir
+      -- | The path of the file, relative to 'root'.
+      FilePath
+      -- | The contents of the file; lines of text.
+      [String]
+  deriving (Show, Generic, FunctorB, TraversableB)
 
 commandWriteFileTracked :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
 commandWriteFileTracked =
@@ -198,37 +208,30 @@ commandWriteFileTracked =
         Just $ do
           path <- Gen.element trackedFiles
           contents <- Gen.list (Range.constant 0 100) (Gen.string (Range.constant 0 100) Gen.ascii)
-          pure $ CommandWriteFile (state_root state) (toDir ".") path contents
+          pure $ CommandWriteFileTracked (state_root state) path contents
     )
-    (\(CommandWriteFile root workDir path content) -> do
-      path' <- evalIO $ canonicalizePath (fromDir (root <> workDir) </> path)
+    (\(CommandWriteFileTracked root path content) -> do
+      path' <- evalIO . canonicalizePath $ fromDir root </> path
       evalIO $ writeFile path' (unlines content)
     )
-    [ Require $ \state (CommandWriteFile _ workDir name _) ->
-        let dirs = Map.keys $ state_files state in
-        (workDir `elem` dirs) &&
-        (workDir <> toDir name) `notElem` dirs &&
-        not (null $ state_trackedFiles state)
-    , Update $ \state (CommandWriteFile _ workDir name content) _output ->
-        let newContent = unlines content in
+    [ Require $ \state (CommandWriteFileTracked _ path _) ->
+        path `elem` state_trackedFiles state
+    , Update $ \state (CommandWriteFileTracked _ path content) _output ->
+        let 
+          (dir, name) = splitFileName path
+          newContent = unlines content
+        in
         state
           { state_files = 
               Map.adjust 
                 (Map.adjust
-                  (\(File oldContent oldStatus) -> 
-                    File newContent $
-                    case oldStatus of
-                      Untracked ->
-                        undefined
-                      Tracked changed ->
-                        Tracked $ changed || oldContent /= newContent
-                  )
+                  (\(File _ status) -> File newContent status)
                   name
                 )
-                workDir
+                dir
                 (state_files state)
           }
-    , Ensure $ \_pre _post _input _output -> do
+    , Ensure $ \_pre _post (CommandWriteFileTracked _ _path _content) _output -> do
         label "write file (tracked)"
         
         pure ()
@@ -276,38 +279,43 @@ commandGitAdd =
             (makeRelative (fromDir $ state_workDir state) <$> toAdd)
     )
     (\(CommandGitAdd root workDir _toAddAbsolute toAddRelative) -> do
-      do
-        let path = root <> workDir
-        annotateShow path
-        b <- evalIO . doesDirectoryExist $ fromDir path
-        assert b
-      
       annotateShow toAddRelative
       (ec, stdout, stderr) <- evalIO $ runIn (root <> workDir) "git" ("add" : toAddRelative) ""
       annotateShow stdout
       annotateShow stderr
       evalExitCode ec
     )
-    [ Require $ \state (CommandGitAdd _ _ toAddAbsolute _toAddRelative) ->
+    [ Require $ \state (CommandGitAdd _ workDir toAddAbsolute toAddRelative) ->
         let files = fst <$> state_allFiles state in
-        state_workDir state `Map.member` state_files state &&
-        all (`elem` files) toAddAbsolute
+        workDir `Map.member` state_files state &&
+        all (`elem` files) toAddAbsolute &&
+        all (\file -> (fromDir workDir </> file) `elem` files) toAddRelative
     , Update $ \state (CommandGitAdd _ _workDir toAddAbsolute _toAddRelative) _output ->
-        state{
-          state_staged =
-            state_staged state 
-            `Set.union` 
-            Set.fromList
-              (filter 
-                (\file ->
-                  let (dir, name) = splitFileName file in
-                  case file_status $ state_dir state dir Map.! name of
-                    Tracked changed -> changed
-                    Untracked -> True
+        state
+          { state_staged =
+              Map.fromList
+                (foldr 
+                  (\file rest ->
+                    let (dir, name) = splitFileName file in
+                    case state_dir state dir Map.! name of
+                      File newContent (Tracked oldContent) ->
+                        if 
+                          fromMaybe 
+                            oldContent 
+                            -- Check changes against the index when possible.
+                            (Map.lookup file $ state_staged state)
+                            /= newContent 
+                        then (file, newContent) : rest
+                        else rest
+                      File newContent Untracked ->
+                        (file, newContent) : rest
+                  )
+                  []
+                  toAddAbsolute
                 )
-                toAddAbsolute
-              )
-        }
+              `Map.union` 
+              state_staged state 
+          }
     , Ensure $ \_pre _post (CommandGitAdd _root _workDir _toAddAbsolute _toAddRelative) () -> do
         label "git add"
     ]
@@ -341,7 +349,7 @@ commandGitListStaged =
     , Ensure $ \_pre post _input stagedFiles -> do
         label "git list staged files"
 
-        state_staged post === stagedFiles
+        Map.keysSet (state_staged post) === stagedFiles
     ]
 
 data CommandGitListUnstaged (v :: Type -> Type)
@@ -352,14 +360,20 @@ data CommandGitListUnstaged (v :: Type -> Type)
       Dir
   deriving (Show, Generic, FunctorB, TraversableB)
 
-state_unstaged :: State v -> Set FilePath
+state_unstaged :: State v -> Map FilePath File
 state_unstaged state =
-  Set.fromList 
-    (fmap fst . 
-      filter (\case; (_, File _ (Tracked True)) -> True; _ -> False) $ 
+  Map.fromList 
+    (filter
+      (\case
+        (path, File newContent (Tracked oldContent)) ->
+          fromMaybe oldContent (Map.lookup path $ state_staged state) /= newContent
+        (path, File newContent Untracked) ->
+          case Map.lookup path $ state_staged state of
+            Nothing -> False
+            Just oldContent -> oldContent /= newContent
+      ) $ 
       state_allFiles state
-    ) 
-    `Set.difference` state_staged state
+    )
 
 commandGitListUnstaged :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
 commandGitListUnstaged =
@@ -382,7 +396,7 @@ commandGitListUnstaged =
     , Ensure $ \_pre post _input unstagedFiles -> do
         label "git list unstaged files"
 
-        state_unstaged post === unstagedFiles
+        Map.keysSet (state_unstaged post) === unstagedFiles
     ]
 
 data CommandCreateDir (v :: Type -> Type) 
@@ -471,17 +485,16 @@ commandGitCommit =
         workDir `Map.member` state_files state &&
         not (null $ state_staged state)
     , Update $ \state (CommandGitCommit _root _workDir _message) _output ->
-        let staged = state_staged state in
         state
-          { state_staged = Set.empty
+          { state_staged = Map.empty
           , state_files =
-              foldl'
-                (\acc stagedFile -> 
+              Map.foldlWithKey'
+                (\acc stagedFile stagedFileContent -> 
                   let (dir, name) = splitFileName stagedFile in
-                  Map.adjust (Map.adjust (\file -> file{ file_status = Tracked False }) name) dir acc
+                  Map.adjust (Map.adjust (\(File newContent _) -> File newContent (Tracked stagedFileContent)) name) dir acc
                 )
                 (state_files state)
-                staged
+                (state_staged state)
           , state_hasCommits = True
           }
     , Ensure $ \_pre _post _input () -> do
@@ -515,7 +528,26 @@ commandGitUstashSave =
         state_hasCommits state &&
         isNothing (state_ustash state)
     , Update $ \state (CommandGitUstashSave _root _workDir) _output ->
-        state { state_ustash = Just (state_unstaged state) }
+        let unstaged = state_unstaged state in
+        state
+          { state_ustash = Just $ fmap file_contents unstaged 
+          , state_files =
+              Map.mapWithKey
+                (\dir files ->
+                  Map.mapWithKey
+                    (\name file ->
+                      let path = fromDir dir </> name in
+                      if Map.member path unstaged
+                      then 
+                        case file_status file of
+                          Tracked oldContent -> file{file_contents = fromMaybe oldContent $ Map.lookup path (state_staged state)}
+                          _ -> undefined
+                      else file
+                    )
+                    files
+                )
+                (state_files state)
+          }
     , Ensure $ \_pre _post _input () -> do
         label "git-ustash save"
 
