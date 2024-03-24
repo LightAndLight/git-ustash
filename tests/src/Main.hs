@@ -59,6 +59,7 @@ commands :: (MonadGen gen, MonadIO m, MonadTest m) => [Command gen m State]
 commands =
   [ commandWriteFileUntracked
   , commandWriteFileTracked
+  , commandReadFile
   , commandCreateDir
   , commandChangeDir
   , commandGitAdd
@@ -137,6 +138,36 @@ initialState tmpDir =
   , state_ustash = Nothing
   , state_hasCommits = False
   }
+
+data CommandReadFile (v :: Type -> Type) 
+  = CommandReadFile
+      -- | 'root'
+      Dir
+      -- | The path of the file, relative to 'root'.
+      FilePath
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+commandReadFile :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandReadFile =
+  Command 
+    (\state -> do
+        let allFiles = state_allFiles state
+        guard . not $ null allFiles
+        Just $ do
+          path <- Gen.element $ fmap fst allFiles
+          pure $ CommandReadFile (state_root state) path
+    )
+    (\(CommandReadFile root path) -> do
+      path' <- evalIO $ canonicalizePath (fromDir root </> path)
+      evalIO $ readFile path'
+    )
+    [ Require $ \state (CommandReadFile _root path) ->
+        path `elem` fmap fst (state_allFiles state)
+    , Ensure $ \_pre post (CommandReadFile _root path) output -> do
+        label "read file"
+        
+        output === file_contents (Map.fromList (state_allFiles post) Map.! path)
+    ]
 
 state_trackedFiles :: State v -> [FilePath]
 state_trackedFiles state = do
