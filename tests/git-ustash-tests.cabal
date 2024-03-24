@@ -28,8 +28,6 @@ test-suite git-ustash-tests
         directory,
         filepath,
         hedgehog,
-        mmorph,
         monad-control,
-        process,
-        resourcet,
-        temporary-resourcet
+        mtl,
+        process

@@ -18,8 +18,6 @@ import System.FilePath ((</>), makeRelative)
 import qualified System.FilePath as FilePath
 import GHC.Stack (HasCallStack, withFrozenCallStack)
 import GHC.Generics (Generic)
-import Control.Monad.Trans.Resource (runResourceT)
-import Control.Monad.Morph (hoist)
 import Control.Monad (when, guard)
 import Control.Exception (finally)
 import Data.Map (Map)
@@ -28,6 +26,8 @@ import Data.Coerce (coerce)
 import qualified Data.Set as Set
 import Data.Bifunctor (first)
 import Data.Maybe (isNothing, fromMaybe, isJust)
+import Control.Monad.Reader.Class (MonadReader, ask)
+import Control.Monad.Reader (runReaderT)
 
 main :: IO Bool
 main = do
@@ -41,7 +41,7 @@ main = do
 
 prop_main :: Dir -> Property
 prop_main testDir = do
-  withTests 1000 . property . hoist runResourceT $ do
+  withTests 1000 . property $ do
     actions <- forAll $ Gen.sequential (Range.linear 1 100) (initialState testDir) commands
     
     exists <- evalIO . doesDirectoryExist $ fromDir testDir
@@ -53,9 +53,10 @@ prop_main testDir = do
     annotateShow stderr
     evalExitCode ec
     
-    executeSequential (initialState testDir) actions
+    flip runReaderT testDir $
+      executeSequential (initialState testDir) actions
     
-commands :: (MonadGen gen, MonadIO m, MonadTest m) => [Command gen m State]
+commands :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => [Command gen m State]
 commands =
   [ commandWriteFileUntracked
   , commandWriteFileTracked
@@ -141,13 +142,11 @@ initialState tmpDir =
 
 data CommandReadFile (v :: Type -> Type) 
   = CommandReadFile
-      -- | 'root'
-      Dir
       -- | The path of the file, relative to 'root'.
       FilePath
   deriving (Show, Generic, FunctorB, TraversableB)
 
-commandReadFile :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandReadFile :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandReadFile =
   Command 
     (\state -> do
@@ -155,15 +154,16 @@ commandReadFile =
         guard . not $ null allFiles
         Just $ do
           path <- Gen.element $ fmap fst allFiles
-          pure $ CommandReadFile (state_root state) path
+          pure $ CommandReadFile path
     )
-    (\(CommandReadFile root path) -> do
+    (\(CommandReadFile path) -> do
+      root <- ask
       path' <- evalIO $ canonicalizePath (fromDir root </> path)
       evalIO $ readFile path'
     )
-    [ Require $ \state (CommandReadFile _root path) ->
+    [ Require $ \state (CommandReadFile path) ->
         path `elem` fmap fst (state_allFiles state)
-    , Ensure $ \_pre post (CommandReadFile _root path) output -> do
+    , Ensure $ \_pre post (CommandReadFile path) output -> do
         label "read file"
         
         output === file_contents (Map.fromList (state_allFiles post) Map.! path)
@@ -178,8 +178,6 @@ state_trackedFiles state = do
 
 data CommandWriteFileUntracked (v :: Type -> Type) 
   = CommandWriteFileUntracked
-      -- | 'root'
-      Dir
       -- | 'workDir'
       Dir
       -- | The path of the file, relative to 'workDir'.
@@ -188,25 +186,26 @@ data CommandWriteFileUntracked (v :: Type -> Type)
       [String]
   deriving (Show, Generic, FunctorB, TraversableB)
 
-commandWriteFileUntracked :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandWriteFileUntracked :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandWriteFileUntracked =
   Command 
     (\state ->
         Just $ do
           name <- Gen.string (Range.constant 1 10) Gen.alphaNum
           contents <- Gen.list (Range.constant 0 100) (Gen.string (Range.constant 0 100) Gen.ascii)
-          pure $ CommandWriteFileUntracked (state_root state) (state_workDir state) name contents
+          pure $ CommandWriteFileUntracked (state_workDir state) name contents
     )
-    (\(CommandWriteFileUntracked root workDir path content) -> do
+    (\(CommandWriteFileUntracked workDir path content) -> do
+      root <- ask
       path' <- evalIO $ canonicalizePath (fromDir (root <> workDir) </> path)
       evalIO $ writeFile path' (unlines content)
     )
-    [ Require $ \state (CommandWriteFileUntracked _ workDir name _) ->
+    [ Require $ \state (CommandWriteFileUntracked workDir name _) ->
         let dirs = Map.keys $ state_files state in
         (workDir `elem` dirs) &&
         (workDir <> toDir name) `notElem` dirs &&
         (fromDir workDir </> name) `notElem` state_trackedFiles state
-    , Update $ \state (CommandWriteFileUntracked _ workDir name content) _output ->
+    , Update $ \state (CommandWriteFileUntracked workDir name content) _output ->
         state{ state_files = Map.insertWith (<>) workDir (Map.singleton name $ File (unlines content) Untracked) (state_files state) }
     , Ensure $ \_pre _post _input _output -> do
         label "write file (untracked)"
@@ -216,15 +215,13 @@ commandWriteFileUntracked =
 
 data CommandWriteFileTracked (v :: Type -> Type) 
   = CommandWriteFileTracked
-      -- | 'root'
-      Dir
       -- | The path of the file, relative to 'root'.
       FilePath
       -- | The contents of the file; lines of text.
       [String]
   deriving (Show, Generic, FunctorB, TraversableB)
 
-commandWriteFileTracked :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandWriteFileTracked :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandWriteFileTracked =
   Command 
     (\state -> do
@@ -233,15 +230,16 @@ commandWriteFileTracked =
         Just $ do
           path <- Gen.element trackedFiles
           contents <- Gen.list (Range.constant 0 100) (Gen.string (Range.constant 0 100) Gen.ascii)
-          pure $ CommandWriteFileTracked (state_root state) path contents
+          pure $ CommandWriteFileTracked path contents
     )
-    (\(CommandWriteFileTracked root path content) -> do
+    (\(CommandWriteFileTracked path content) -> do
+      root <- ask
       path' <- evalIO . canonicalizePath $ fromDir root </> path
       evalIO $ writeFile path' (unlines content)
     )
-    [ Require $ \state (CommandWriteFileTracked _ path _) ->
+    [ Require $ \state (CommandWriteFileTracked path _) ->
         path `elem` state_trackedFiles state
-    , Update $ \state (CommandWriteFileTracked _ path content) _output ->
+    , Update $ \state (CommandWriteFileTracked path content) _output ->
         let 
           (dir, name) = splitFileName path
           newContent = unlines content
@@ -256,7 +254,7 @@ commandWriteFileTracked =
                 dir
                 (state_files state)
           }
-    , Ensure $ \_pre _post (CommandWriteFileTracked _ _path _content) _output -> do
+    , Ensure $ \_pre _post (CommandWriteFileTracked _path _content) _output -> do
         label "write file (tracked)"
         
         pure ()
@@ -264,8 +262,6 @@ commandWriteFileTracked =
 
 data CommandGitAdd (v :: Type -> Type) 
   = CommandGitAdd
-    -- | 'root'
-    Dir
     -- | 'workDir'
     Dir
     -- | The files to add, relative to 'root'.
@@ -287,7 +283,7 @@ state_dir state dir =
     Just a ->
       a
 
-commandGitAdd :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitAdd :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandGitAdd =
   Command 
     (\state ->
@@ -298,24 +294,25 @@ commandGitAdd =
         toAdd <- Gen.subsequence files
         pure $
           CommandGitAdd
-            (state_root state)
             (state_workDir state)
             toAdd
             (makeRelative (fromDir $ state_workDir state) <$> toAdd)
     )
-    (\(CommandGitAdd root workDir _toAddAbsolute toAddRelative) -> do
+    (\(CommandGitAdd workDir _toAddAbsolute toAddRelative) -> do
+      root <- ask
+      
       annotateShow toAddRelative
       (ec, stdout, stderr) <- evalIO $ runIn (root <> workDir) "git" ("add" : toAddRelative) ""
       annotateShow stdout
       annotateShow stderr
       evalExitCode ec
     )
-    [ Require $ \state (CommandGitAdd _ workDir toAddAbsolute toAddRelative) ->
+    [ Require $ \state (CommandGitAdd workDir toAddAbsolute toAddRelative) ->
         let files = fst <$> state_allFiles state in
         workDir `Map.member` state_files state &&
         all (`elem` files) toAddAbsolute &&
         all (\file -> (fromDir workDir </> file) `elem` files) toAddRelative
-    , Update $ \state (CommandGitAdd _ _workDir toAddAbsolute _toAddRelative) _output ->
+    , Update $ \state (CommandGitAdd _workDir toAddAbsolute _toAddRelative) _output ->
         state
           { state_staged =
               Map.fromList
@@ -341,32 +338,31 @@ commandGitAdd =
               `Map.union` 
               state_staged state 
           }
-    , Ensure $ \_pre _post (CommandGitAdd _root _workDir _toAddAbsolute _toAddRelative) () -> do
+    , Ensure $ \_pre _post (CommandGitAdd _workDir _toAddAbsolute _toAddRelative) () -> do
         label "git add"
     ]
 
 data CommandGitListStaged (v :: Type -> Type)
   = CommandGitListStaged
-      -- | 'root'
-      Dir
       -- | 'workDir'
       Dir
   deriving (Show, Generic, FunctorB, TraversableB)
 
-commandGitListStaged :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitListStaged :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandGitListStaged =
   Command 
     (\state ->
-      Just . pure $ CommandGitListStaged (state_root state) (state_workDir state)
+      Just . pure $ CommandGitListStaged (state_workDir state)
     )
-    (\(CommandGitListStaged root workDir) -> do
+    (\(CommandGitListStaged workDir) -> do
+      root <- ask
       (ec, stdout, stderr) <- evalIO $ runIn (root <> workDir) "git" ["diff", "--cached", "--name-only"] ""
       annotateShow stderr
       evalExitCode ec
     
       pure . Set.fromList $ ("." </>) <$> lines stdout
     )
-    [ Require $ \state (CommandGitListStaged _ workDir) ->
+    [ Require $ \state (CommandGitListStaged workDir) ->
         let dirs = Map.keys (state_files state) in
         (workDir `elem` dirs)
     , Update $ \state _command _output ->
@@ -379,8 +375,6 @@ commandGitListStaged =
 
 data CommandGitListUnstaged (v :: Type -> Type)
   = CommandGitListUnstaged
-      -- | 'root'
-      Dir
       -- | 'workDir'
       Dir
   deriving (Show, Generic, FunctorB, TraversableB)
@@ -400,20 +394,21 @@ state_unstaged state =
       state_allFiles state
     )
 
-commandGitListUnstaged :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitListUnstaged :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandGitListUnstaged =
   Command 
     (\state ->
-      Just . pure $ CommandGitListUnstaged (state_root state) (state_workDir state)
+      Just . pure $ CommandGitListUnstaged (state_workDir state)
     )
-    (\(CommandGitListUnstaged root workDir) -> do
+    (\(CommandGitListUnstaged workDir) -> do
+      root <- ask
       (ec, stdout, stderr) <- evalIO $ runIn (root <> workDir) "git" ["diff", "--name-only"] ""
       annotateShow stderr
       evalExitCode ec
     
       pure . Set.fromList $ ("." </>) <$> lines stdout
     )
-    [ Require $ \state (CommandGitListUnstaged _ workDir) ->
+    [ Require $ \state (CommandGitListUnstaged workDir) ->
         let dirs = Map.keys (state_files state) in
         (workDir `elem` dirs)
     , Update $ \state _command _output ->
@@ -426,8 +421,6 @@ commandGitListUnstaged =
 
 data CommandGitListUntracked (v :: Type -> Type)
   = CommandGitListUntracked
-      -- | 'root'
-      Dir
   deriving (Show, Generic, FunctorB, TraversableB)
 
 state_untracked :: State v -> [FilePath]
@@ -438,13 +431,14 @@ state_untracked state = do
   guard $ file_status file == Untracked && not (Map.member path (state_staged state))
   pure path
 
-commandGitListUntracked :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitListUntracked :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandGitListUntracked =
   Command 
-    (\state ->
-      Just . pure $ CommandGitListUntracked (state_root state)
+    (\_ ->
+      Just $ pure CommandGitListUntracked
     )
-    (\(CommandGitListUntracked root) -> do
+    (\CommandGitListUntracked -> do
+      root <- ask
       (ec, stdout, stderr) <- evalIO $ runIn root "git" ["ls-files", "--other", "--exclude-standard"] ""
       annotateShow stderr
       evalExitCode ec
@@ -459,26 +453,25 @@ commandGitListUntracked =
 
 data CommandCreateDir (v :: Type -> Type) 
   = CommandCreateDir
-      -- | 'root'
-      Dir
       -- | 'workDir'
       Dir
       -- | The path of the directory, relative to 'workDir'.
       Dir
   deriving (Show, Generic, FunctorB, TraversableB)
 
-commandCreateDir :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandCreateDir :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandCreateDir =
   Command 
     (\state ->
       Just $ do
         name <- Gen.string (Range.constant 1 10) Gen.alphaNum
-        pure $ CommandCreateDir (state_root state) (state_workDir state) (toDir name)
+        pure $ CommandCreateDir (state_workDir state) (toDir name)
     )
-    (\(CommandCreateDir root workDir target) -> do
+    (\(CommandCreateDir workDir target) -> do
+      root <- ask
       evalIO . createDirectory $ fromDir (root <> workDir <> target)
     )
-    [ Require $ \state (CommandCreateDir _ workDir path) ->
+    [ Require $ \state (CommandCreateDir workDir path) ->
         let 
           dirs = Map.keys (state_files state)
           files = fst <$> state_allFiles state
@@ -486,7 +479,7 @@ commandCreateDir =
         (workDir `elem` dirs) &&
         (workDir <> path) `notElem` dirs &&
         fromDir (workDir <> path) `notElem` files
-    , Update $ \state (CommandCreateDir _ workDir path) _output ->
+    , Update $ \state (CommandCreateDir workDir path) _output ->
         state{ state_files = Map.insert (workDir <> path) mempty (state_files state) }
     , Ensure $ \_pre _post _input _output -> do
         label "create dir"
@@ -495,7 +488,9 @@ commandCreateDir =
     ]
 
 data CommandChangeDir (v :: Type -> Type) 
-  = CommandChangeDir Dir
+  = CommandChangeDir
+      -- | The target directory, relative to 'workDir'.
+      Dir
   deriving (Show, Generic, FunctorB, TraversableB)
 
 commandChangeDir :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
@@ -517,32 +512,31 @@ commandChangeDir =
 
 data CommandGitCommit (v :: Type -> Type) 
   = CommandGitCommit
-      -- | 'root'
-      Dir
       -- | 'workDir'
       Dir
       -- | Commit message.
       String
   deriving (Show, Generic, FunctorB, TraversableB)
 
-commandGitCommit :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitCommit :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandGitCommit =
   Command 
     (\state ->
         Just $ do
           message <- Gen.string (Range.constant 1 40) Gen.alphaNum
-          pure $ CommandGitCommit (state_root state) (state_workDir state) message
+          pure $ CommandGitCommit (state_workDir state) message
     )
-    (\(CommandGitCommit root workDir message) -> do
+    (\(CommandGitCommit workDir message) -> do
+      root <- ask
       (ec, stdout, stderr) <- evalIO $ runIn (root <> workDir) "git" ["commit", "-m", message] ""
       annotateShow stdout
       annotateShow stderr
       evalExitCode ec
     )
-    [ Require $ \state (CommandGitCommit _ workDir _) -> 
+    [ Require $ \state (CommandGitCommit workDir _) -> 
         workDir `Map.member` state_files state &&
         not (null $ state_staged state)
-    , Update $ \state (CommandGitCommit _root _workDir _message) _output ->
+    , Update $ \state (CommandGitCommit _workDir _message) _output ->
         state
           { state_staged = Map.empty
           , state_files =
@@ -563,29 +557,28 @@ commandGitCommit =
 
 data CommandGitUstashSave (v :: Type -> Type) 
   = CommandGitUstashSave
-      -- | 'root'
-      Dir
       -- | 'workDir'
       Dir
   deriving (Show, Generic, FunctorB, TraversableB)
 
-commandGitUstashSave :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitUstashSave :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandGitUstashSave =
   Command 
     (\state ->
-      Just . pure $ CommandGitUstashSave (state_root state) (state_workDir state)
+      Just . pure $ CommandGitUstashSave (state_workDir state)
     )
-    (\(CommandGitUstashSave root workDir) -> do
+    (\(CommandGitUstashSave workDir) -> do
+      root <- ask
       (ec, stdout, stderr) <- evalIO $ runIn (root <> workDir) "git-ustash" ["save"] ""
       annotateShow stdout
       annotateShow stderr
       evalExitCode ec
     )
-    [ Require $ \state (CommandGitUstashSave _ workDir) -> 
+    [ Require $ \state (CommandGitUstashSave workDir) -> 
         workDir `Map.member` state_files state &&
         state_hasCommits state &&
         isNothing (state_ustash state)
-    , Update $ \state (CommandGitUstashSave _root _workDir) _output ->
+    , Update $ \state (CommandGitUstashSave _workDir) _output ->
         let unstaged = state_unstaged state in
         state
           { state_ustash = Just $ fmap file_contents unstaged 
@@ -616,29 +609,28 @@ commandGitUstashSave =
 
 data CommandGitUstashRestore (v :: Type -> Type) 
   = CommandGitUstashRestore
-      -- | 'root'
-      Dir
       -- | 'workDir'
       Dir
   deriving (Show, Generic, FunctorB, TraversableB)
 
-commandGitUstashRestore :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitUstashRestore :: (MonadGen gen, MonadIO m, MonadTest m, MonadReader Dir m) => Command gen m State
 commandGitUstashRestore =
   Command 
     (\state ->
-      Just . pure $ CommandGitUstashRestore (state_root state) (state_workDir state)
+      Just . pure $ CommandGitUstashRestore (state_workDir state)
     )
-    (\(CommandGitUstashRestore root workDir) -> do
+    (\(CommandGitUstashRestore workDir) -> do
+      root <- ask
       (ec, stdout, stderr) <- evalIO $ runIn (root <> workDir) "git-ustash" ["restore"] ""
       annotateShow stdout
       annotateShow stderr
       evalExitCode ec
     )
-    [ Require $ \state (CommandGitUstashRestore _ workDir) -> 
+    [ Require $ \state (CommandGitUstashRestore workDir) -> 
         workDir `Map.member` state_files state &&
         state_hasCommits state &&
         isJust (state_ustash state)
-    , Update $ \state (CommandGitUstashRestore _root _workDir) _output ->
+    , Update $ \state (CommandGitUstashRestore _workDir) _output ->
         let ustashed = fromMaybe mempty $ state_ustash state in
         state
           { state_ustash = Nothing
