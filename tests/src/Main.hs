@@ -18,7 +18,6 @@ import System.FilePath ((</>), makeRelative)
 import qualified System.FilePath as FilePath
 import GHC.Stack (HasCallStack, withFrozenCallStack)
 import GHC.Generics (Generic)
-import Data.Foldable (foldl')
 import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.Morph (hoist)
 import Control.Monad (when, guard)
@@ -26,10 +25,9 @@ import Control.Exception (finally)
 import Data.Map (Map)
 import qualified Data.Map.Strict as Map
 import Data.Coerce (coerce)
-import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Bifunctor (first)
-import Data.Maybe (isNothing, fromMaybe)
+import Data.Maybe (isNothing, fromMaybe, isJust)
 
 main :: IO Bool
 main = do
@@ -67,7 +65,9 @@ commands =
   , commandGitCommit
   , commandGitListStaged
   , commandGitListUnstaged
+  , commandGitListUntracked
   , commandGitUstashSave
+  , commandGitUstashRestore
   ]
 
 runIn :: Dir -> String -> [String] -> String -> IO (ExitCode, String, String)
@@ -120,6 +120,7 @@ data State (v :: Type -> Type)
   }
 
 data File = File {file_contents :: String, file_status :: FileStatus}
+  deriving (Eq, Show)
 
 data FileStatus 
   = Untracked
@@ -136,13 +137,6 @@ initialState tmpDir =
   , state_ustash = Nothing
   , state_hasCommits = False
   }
-
-state_untrackedFiles :: State v -> [FilePath]
-state_untrackedFiles state = do
-  (dir, names) <- Map.toList $ state_files state
-  (name, file) <- Map.toList names
-  guard $ file_status file == Untracked
-  pure $ fromDir dir </> name
 
 state_trackedFiles :: State v -> [FilePath]
 state_trackedFiles state = do
@@ -399,6 +393,39 @@ commandGitListUnstaged =
         Map.keysSet (state_unstaged post) === unstagedFiles
     ]
 
+data CommandGitListUntracked (v :: Type -> Type)
+  = CommandGitListUntracked
+      -- | 'root'
+      Dir
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+state_untracked :: State v -> [FilePath]
+state_untracked state = do
+  (dir, names) <- Map.toList $ state_files state
+  (name, file) <- Map.toList names
+  let path = fromDir dir </> name
+  guard $ file_status file == Untracked && not (Map.member path (state_staged state))
+  pure path
+
+commandGitListUntracked :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitListUntracked =
+  Command 
+    (\state ->
+      Just . pure $ CommandGitListUntracked (state_root state)
+    )
+    (\(CommandGitListUntracked root) -> do
+      (ec, stdout, stderr) <- evalIO $ runIn root "git" ["ls-files", "--other", "--exclude-standard"] ""
+      annotateShow stderr
+      evalExitCode ec
+    
+      pure . Set.fromList $ ("." </>) <$> lines stdout
+    )
+    [ Ensure $ \_pre post _input untrackedFiles -> do
+        label "git list untracked files"
+
+        Set.fromList (state_untracked post) === untrackedFiles
+    ]
+
 data CommandCreateDir (v :: Type -> Type) 
   = CommandCreateDir
       -- | 'root'
@@ -548,8 +575,61 @@ commandGitUstashSave =
                 )
                 (state_files state)
           }
-    , Ensure $ \_pre _post _input () -> do
+    , Ensure $ \_pre post _input () -> do
         label "git-ustash save"
 
-        pure ()
+        let unstaged = state_unstaged post
+        annotateShow unstaged
+        assert $ Map.null unstaged
+    ]
+
+data CommandGitUstashRestore (v :: Type -> Type) 
+  = CommandGitUstashRestore
+      -- | 'root'
+      Dir
+      -- | 'workDir'
+      Dir
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+commandGitUstashRestore :: (MonadGen gen, MonadIO m, MonadTest m) => Command gen m State
+commandGitUstashRestore =
+  Command 
+    (\state ->
+      Just . pure $ CommandGitUstashRestore (state_root state) (state_workDir state)
+    )
+    (\(CommandGitUstashRestore root workDir) -> do
+      (ec, stdout, stderr) <- evalIO $ runIn (root <> workDir) "git-ustash" ["restore"] ""
+      annotateShow stdout
+      annotateShow stderr
+      evalExitCode ec
+    )
+    [ Require $ \state (CommandGitUstashRestore _ workDir) -> 
+        workDir `Map.member` state_files state &&
+        state_hasCommits state &&
+        isJust (state_ustash state)
+    , Update $ \state (CommandGitUstashRestore _root _workDir) _output ->
+        let ustashed = fromMaybe mempty $ state_ustash state in
+        state
+          { state_ustash = Nothing
+          , state_files =
+              Map.mapWithKey
+                (\dir files ->
+                  Map.mapWithKey
+                    (\name file ->
+                      let path = fromDir dir </> name in
+                      case Map.lookup path ustashed of
+                        Nothing ->
+                          file
+                        Just newContent ->
+                          file{file_contents = newContent}
+                    )
+                    files
+                )
+                (state_files state)
+          }
+    , Ensure $ \pre post _input () -> do
+        label "git-ustash restore"
+
+        fmap file_contents (state_unstaged post) === 
+          fromMaybe mempty (state_ustash pre) <> fmap file_contents (state_unstaged pre)
     ]
