@@ -1,5 +1,7 @@
 # `git-ustash`
 
+**Note: [`git-format-staged`](https://github.com/LightAndLight/git-format-staged) solves my [original problem](#background) much better than `git-ustash` does.**
+
 Save and restore unstaged changes in Git.
 
 `git-ustash save` saves all unstaged changes, and *only* unstaged changes.
